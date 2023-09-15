@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                          Amazing |
-//|                             Copyright © 2008-2022, EarnForex.com |
+//|                                  Copyright © 2023, EarnForex.com |
 //|                                       https://www.earnforex.com/ |
 //|                                 Based on the EA by FiFtHeLeMeNt. |
 //+------------------------------------------------------------------+
-#property copyright "Copyright © 2008-2022, EarnForex"
+#property copyright "Copyright © 2023, EarnForex"
 #property link      "https://www.earnforex.com/metatrader-expert-advisors/Amazing/"
-#property version   "1.03"
+#property version   "1.04"
 
 #property description "Amazing - EA that helps to trade on news."
 #property description "Set the NewsDateTime input parameter to the actual date and time of the news."
@@ -18,20 +18,30 @@
 
 input group "Main"
 input datetime NewsDateTime = __DATE__; // NewsDateTime: Date and time of the news release.
-input int TP = 20; // TP: Take-profit
+input int EntryDistance = 100; // EntryDistance: Entry distance from recent high/low in points.
+input int StopLoss = 200; // StopLoss: Stop-loss in points.
+input int TakeProfit = 200; // TakeProfit: Take-profit in points.
 input int CTCBN = 0; // CTCBN: Number of candles to check before news for High & Low.
 input int SecBPO = 300; // SecBPO: Seconds before news to place pending orders.
 input int SecBMO = 0; // SecBMO: Seconds before news when to stop modifying orders.
 input int STWAN = 150; // STWAN: Seconds to wait after news to delete pending orders.
 input bool OCO = true; // OCO: EA will cancel the other pending order if one is hit.
-input int BEPips = 0; // BEPips: Pips of profit when EA will move SL to breakeven + 1.
-input int TrailingStop = 0; // Trailing Stop
+input int BEPoints = 0; // BEPoints: Points of profit when EA will move SL to breakeven + 1.
+input int TrailingStop = 0; // Trailing Stop in points
+input group "ATR"
+input bool UseATR = false; // Use ATR-based stop-loss and take-profit levels.
+input int ATR_Period = 14; // ATR Period.
+input double ATR_Multiplier_SL = 5; // ATR multiplier for SL.
+input double ATR_Multiplier_TP = 5; // ATR multiplier for TP.
 input group "Money management"
-input bool MM = false; // MM: Money management
-input int RiskPercent = 1;
-input double Lots = 0.1;
+input double Lots = 0.01;
+input bool MM  = true; // Money Management, if true - position sizing based on stop-loss.
+input double Risk = 1; // Risk - Risk tolerance in percentage points.
+input double FixedBalance = 0; // FixedBalance: If > 0, trade size calc. uses it as balance.
+input double MoneyRisk = 0; // MoneyRisk: Risk tolerance in account currency.
+input bool UseMoneyInsteadOfPercentage = false; // Use money risk instead of percentage.
+input bool UseEquityInsteadOfBalance = false; // Use equity instead of balance.
 input group "Miscellaneous"
-input int Slippage = 3;  // Slippage: Tolerated slippage in pips.
 input string TradeLog = "Am_Log_"; // TradeLog: Log file prefix.
 input string Commentary = "Amazing"; // Commentary: trade description.
 
@@ -39,8 +49,17 @@ input string Commentary = "Amazing"; // Commentary: trade description.
 double buy_stop_entry, sell_stop_entry, buy_stop_loss, sell_stop_loss, buy_take_profit, sell_take_profit;
 int Magic;
 string filename;
-double Poin;
-int Deviation;
+
+double SL, TP;
+int lot_decimal_places;
+int ATR_handle;
+double RiskMoney;
+string AccountCurrency = "";
+string ProfitCurrency = "";
+string BaseCurrency = "";
+ENUM_SYMBOL_CALC_MODE CalcMode;
+string ReferencePair = NULL;
+bool ReferenceSymbolMode;
 
 // Main trading objects:
 CTrade *Trade;
@@ -51,17 +70,11 @@ void OnInit()
 {
     Magic = (int)NewsDateTime; // Dynamically generated Magic number to allow multiple instances for different news announcements.
 
-    // Checking for unconventional Point digits number.
-    if ((_Point == 0.00001) || (_Point == 0.001))
-    {
-        Poin = _Point * 10;
-        Deviation = Slippage * 10;
-    }
-    else
-    {
-        Poin = _Point; // Normal
-        Deviation = Slippage;
-    }
+    double min_lot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
+    double lot_step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+    lot_decimal_places = CountDecimalPlaces(lot_step);
+    Print("Minimum lot: ", DoubleToString(min_lot, 2), ", lot step: ", DoubleToString(lot_step, lot_decimal_places), ".");
+    if ((Lots < min_lot) && (!MM)) Alert("Lots should be not less than: ", DoubleToString(min_lot, lot_decimal_places), ".");
 
     if (StringLen(Commentary) > 0)
     {
@@ -69,10 +82,15 @@ void OnInit()
         TimeCurrent(dt);
         filename = TradeLog + Symbol() + "-" + IntegerToString(dt.mon) + "-" + IntegerToString(dt.day) + ".txt";
     }
+    
+    if (UseATR) ATR_handle = iATR(NULL, 0, ATR_Period);
 
+    // If UseATR = false, these values will be used. Otherwise, ATR values will be calculated later.
+    SL = StopLoss;
+    TP = TakeProfit;
+    
     // Initialize the Trade class object
     Trade = new CTrade;
-    Trade.SetDeviationInPoints(Deviation);
     Trade.SetExpertMagicNumber(Magic);
 }
 
@@ -80,24 +98,6 @@ void OnDeinit(const int reason)
 {
     Comment("");
     delete Trade;
-}
-
-//+------------------------------------------------------------------+
-//| Returns lots number based on simple money management.            |
-//+------------------------------------------------------------------+
-double LotsOptimized()
-{
-    double lot = Lots;
-
-    if (MM)
-    {
-        double LotStep = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
-        int LotStep_digits = CountDecimalPlaces(LotStep);
-        lot = NormalizeDouble(MathFloor(AccountInfoDouble(ACCOUNT_MARGIN_FREE) * RiskPercent / 100) / 100, LotStep_digits);
-    }
-
-    // lot at this point is the number of standard lots.
-    return lot;
 }
 
 // Checks the current situation with orders and positions.
@@ -162,7 +162,7 @@ void OpenBuyStop()
 {
     for (int tries = 0; tries < 10; tries++)
     {
-        Trade.OrderOpen(_Symbol, ORDER_TYPE_BUY_STOP, LotsOptimized(), 0, buy_stop_entry, buy_stop_loss, buy_take_profit, 0, 0, Commentary);
+        Trade.OrderOpen(_Symbol, ORDER_TYPE_BUY_STOP, LotsOptimized(ORDER_TYPE_BUY, buy_stop_entry), 0, buy_stop_entry, buy_stop_loss, buy_take_profit, 0, 0, Commentary);
         ulong ticket = Trade.ResultOrder(); // Get ticket.
         if (ticket < 0)
         {
@@ -181,7 +181,7 @@ void OpenSellStop()
 {
     for (int tries = 0; tries < 10; tries++)
     {
-        Trade.OrderOpen(_Symbol, ORDER_TYPE_SELL_STOP, LotsOptimized(), 0, sell_stop_entry, sell_stop_loss, sell_take_profit, 0, 0, Commentary);
+        Trade.OrderOpen(_Symbol, ORDER_TYPE_SELL_STOP, LotsOptimized(ORDER_TYPE_SELL, sell_stop_entry), 0, sell_stop_entry, sell_stop_loss, sell_take_profit, 0, 0, Commentary);
         ulong ticket = Trade.ResultOrder(); // Get ticket.
         if (ticket < 0)
         {
@@ -196,7 +196,7 @@ void OpenSellStop()
 }
 
 // Set breakeven on positions if needed.
-void DoBE(int byPips)
+void DoBE(int byPoints)
 {
     double Ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
     double Bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
@@ -211,9 +211,9 @@ void DoBE(int byPips)
         }
         if ((PositionGetString(POSITION_SYMBOL) != Symbol()) || (PositionGetInteger(POSITION_MAGIC) != Magic)) continue;
         
-        if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) && (NormalizeDouble(Bid - PositionGetDouble(POSITION_PRICE_OPEN), _Digits) > NormalizeDouble(byPips * Poin, _Digits)) && (PositionInfo.StopLoss() < PositionGetDouble(POSITION_PRICE_OPEN)))
+        if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) && (NormalizeDouble(Bid - PositionGetDouble(POSITION_PRICE_OPEN), _Digits) > NormalizeDouble(byPoints * _Point, _Digits)) && (PositionInfo.StopLoss() < PositionGetDouble(POSITION_PRICE_OPEN)))
         {
-            double NewSL = NormalizeDouble(PositionInfo.PriceOpen() + Poin, _Digits);
+            double NewSL = NormalizeDouble(PositionInfo.PriceOpen() + _Point, _Digits);
             if (Bid - NewSL > SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) * _Point)
             {
                 Write("Moving stop-loss of Buy order to breakeven + 1 pip.");
@@ -223,9 +223,9 @@ void DoBE(int byPips)
                 }
             }
         }
-        else if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) && (NormalizeDouble(PositionGetDouble(POSITION_PRICE_OPEN) - Ask, _Digits) > NormalizeDouble(byPips * Poin, _Digits)) && (PositionInfo.StopLoss() > PositionGetDouble(POSITION_PRICE_OPEN)))
+        else if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) && (NormalizeDouble(PositionGetDouble(POSITION_PRICE_OPEN) - Ask, _Digits) > NormalizeDouble(byPoints * _Point, _Digits)) && (PositionInfo.StopLoss() > PositionGetDouble(POSITION_PRICE_OPEN)))
         {
-            double NewSL = NormalizeDouble(PositionInfo.PriceOpen() - Poin, _Digits);
+            double NewSL = NormalizeDouble(PositionInfo.PriceOpen() - _Point, _Digits);
             if (NewSL - Ask > SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) * _Point)
             {
                 Write("Moving stop-loss of Sell order to breakeven - 1 pip.");
@@ -250,17 +250,17 @@ void DoTrail()
         if (PositionGetSymbol(cnt) != Symbol()) continue;
         if (PositionGetInteger(POSITION_MAGIC) != Magic) continue;
 
-        if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) && (Bid - PositionGetDouble(POSITION_PRICE_OPEN) > TrailingStop * Poin) && (PositionGetDouble(POSITION_SL) < NormalizeDouble(Bid - TrailingStop * Poin, _Digits)))
+        if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) && (Bid - PositionGetDouble(POSITION_PRICE_OPEN) > TrailingStop * _Point) && (PositionGetDouble(POSITION_SL) < NormalizeDouble(Bid - TrailingStop * _Point, _Digits)))
         {
-            double NewSL = NormalizeDouble(Bid - TrailingStop * Poin, _Digits);
+            double NewSL = NormalizeDouble(Bid - TrailingStop * _Point, _Digits);
             if (Bid - NewSL > SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) * _Point)
             {
                 Trade.PositionModify(_Symbol, NewSL, PositionGetDouble(POSITION_TP));
             }
         }
-        else if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) && (PositionGetDouble(POSITION_PRICE_OPEN) - Ask > TrailingStop * Poin) && ((PositionGetDouble(POSITION_SL) > NormalizeDouble(Ask + TrailingStop * Poin, _Digits)) || (PositionGetDouble(POSITION_SL) == 0)))
+        else if ((PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) && (PositionGetDouble(POSITION_PRICE_OPEN) - Ask > TrailingStop * _Point) && ((PositionGetDouble(POSITION_SL) > NormalizeDouble(Ask + TrailingStop * _Point, _Digits)) || (PositionGetDouble(POSITION_SL) == 0)))
         {
-            double NewSL = NormalizeDouble(Ask + TrailingStop * Poin, _Digits);
+            double NewSL = NormalizeDouble(Ask + TrailingStop * _Point, _Digits);
             if (NewSL - Ask > SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) * _Point)
             {
                 Trade.PositionModify(_Symbol, NewSL, PositionInfo.TakeProfit());
@@ -367,7 +367,15 @@ void Write(string str)
 
 void OnTick()
 {
-    if (BEPips > 0) DoBE(BEPips);
+    AccountCurrency = AccountInfoString(ACCOUNT_CURRENCY);
+    // A rough patch for cases when account currency is set as RUR instead of RUB.
+    if (AccountCurrency == "RUR") AccountCurrency = "RUB";
+    ProfitCurrency = SymbolInfoString(Symbol(), SYMBOL_CURRENCY_PROFIT);
+    if (ProfitCurrency == "RUR") ProfitCurrency = "RUB";
+    BaseCurrency = SymbolInfoString(Symbol(), SYMBOL_CURRENCY_BASE);
+    if (BaseCurrency == "RUR") BaseCurrency = "RUB";
+    
+    if (BEPoints > 0) DoBE(BEPoints);
     if (TrailingStop > 0) DoTrail();
 
     int OrdersCondition = CheckOrdersCondition();
@@ -388,12 +396,32 @@ void OnTick()
         if (rates[i].low < recent_low) recent_low = rates[i].low;
     }
     double spread = Ask - Bid;
-    buy_stop_entry = NormalizeDouble(recent_high + spread + 10 * Poin, _Digits);
-    sell_stop_entry = NormalizeDouble(recent_low - 10 * Poin, _Digits);
-    buy_stop_loss = NormalizeDouble(recent_high + spread, _Digits);
-    sell_stop_loss = NormalizeDouble(recent_low, _Digits);
-    buy_take_profit = NormalizeDouble(buy_stop_entry + TP * Poin, _Digits);
-    sell_take_profit= NormalizeDouble(sell_stop_entry - TP * Poin, _Digits);
+    buy_stop_entry = NormalizeDouble(recent_high + spread + EntryDistance * _Point, _Digits);
+    sell_stop_entry = NormalizeDouble(recent_low - EntryDistance * _Point, _Digits);
+
+    if (UseATR)
+    {
+        // Getting the ATR values.
+        double ATR;
+        double ATR_buffer[1];
+        if (CopyBuffer(ATR_handle, 0, 1, 1, ATR_buffer) != 1)
+        {
+            Print("ATR data not ready!");
+            return;
+        }
+        ATR = ATR_buffer[0];
+        SL = ATR * ATR_Multiplier_SL;
+        if (SL <= (SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) + SymbolInfoInteger(Symbol(), SYMBOL_SPREAD)) * _Point) SL = (SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) + SymbolInfoInteger(Symbol(), SYMBOL_SPREAD)) * _Point;
+        TP = ATR * ATR_Multiplier_TP;
+        if (TP <= (SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) + SymbolInfoInteger(Symbol(), SYMBOL_SPREAD)) * _Point) TP = (SymbolInfoInteger(Symbol(), SYMBOL_TRADE_STOPS_LEVEL) + SymbolInfoInteger(Symbol(), SYMBOL_SPREAD)) * _Point;
+        SL /= _Point;
+        TP /= _Point;
+    }
+
+    buy_stop_loss = NormalizeDouble(buy_stop_entry - SL * _Point, _Digits);
+    sell_stop_loss = NormalizeDouble(sell_stop_entry + SL * _Point, _Digits);
+    buy_take_profit = NormalizeDouble(buy_stop_entry + TP * _Point, _Digits);
+    sell_take_profit= NormalizeDouble(sell_stop_entry - TP * _Point, _Digits);
 
     int sectonews = (int)(NewsDateTime - TimeCurrent());
     Comment("\nAmazing Expert Advisor",
@@ -402,8 +430,8 @@ void OnTick()
             "\nNews time: ", TimeToString(NewsDateTime), 
             "\nCurrent time: ", TimeToString(TimeCurrent()), 
             "\nSeconds left to news: ", IntegerToString(sectonews), 
-            "\nCTCBN: ", CTCBN, " SecBPO: ", SecBPO, " SecBMO: ", SecBMO, " STWAN: ", STWAN, " OCO: ", OCO, " BEPips: ", BEPips, 
-            "\nMoney management: ", MM, " RiskPercent: ", RiskPercent, " Lots: ", LotsOptimized());
+            "\nCTCBN: ", CTCBN, " SecBPO: ", SecBPO, " SecBMO: ", SecBMO, " STWAN: ", STWAN, " OCO: ", OCO, " BEPips: ", BEPoints, 
+            "\nMoney management: ", MM, " Risk: ", DoubleToString(RiskMoney, 2), " ", AccountCurrency, " Lots (B/S): ", DoubleToString(LotsOptimized(ORDER_TYPE_BUY, buy_stop_entry), lot_decimal_places), "/", DoubleToString(LotsOptimized(ORDER_TYPE_SELL, sell_stop_entry), lot_decimal_places));
 
     // Before the news, but after the time when orders have to be placed.
     if ((TimeCurrent() < NewsDateTime) && (TimeCurrent() >= NewsDateTime - SecBPO))
@@ -470,6 +498,188 @@ void OnTick()
             DeleteSellStop();
         }
     }
+}
+
+//+------------------------------------------------------------------+
+//| Calculates unit cost based on profit calculation mode.           |
+//+------------------------------------------------------------------+
+double CalculateUnitCost()
+{
+    double UnitCost;
+    // CFD.
+    if (((CalcMode == SYMBOL_CALC_MODE_CFD) || (CalcMode == SYMBOL_CALC_MODE_CFDINDEX) || (CalcMode == SYMBOL_CALC_MODE_CFDLEVERAGE)))
+        UnitCost = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE) * SymbolInfoDouble(Symbol(), SYMBOL_TRADE_CONTRACT_SIZE);
+    // With Forex and futures instruments, tick value already equals 1 unit cost.
+    else UnitCost = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE_LOSS);
+    
+    return UnitCost;
+}
+
+//+-----------------------------------------------------------------------------------+
+//| Calculates necessary adjustments for cases when GivenCurrency != AccountCurrency. |
+//+-----------------------------------------------------------------------------------+
+double CalculateAdjustment()
+{
+    if (ReferencePair == NULL)
+    {
+        ReferencePair = GetSymbolByCurrencies(ProfitCurrency, AccountCurrency);
+        ReferenceSymbolMode = true;
+        // Failed.
+        if (ReferencePair == NULL)
+        {
+            // Reversing currencies.
+            ReferencePair = GetSymbolByCurrencies(AccountCurrency, ProfitCurrency);
+            ReferenceSymbolMode = false;
+        }
+    }
+    if (ReferencePair == NULL)
+    {
+        Print("Error! Cannot detect proper currency pair for adjustment calculation: ", ProfitCurrency, ", ", AccountCurrency, ".");
+        ReferencePair = Symbol();
+        return 1;
+    }
+    MqlTick tick;
+    SymbolInfoTick(ReferencePair, tick);
+    return GetCurrencyCorrectionCoefficient(tick);
+}
+
+//+---------------------------------------------------------------------------+
+//| Returns a currency pair with specified base currency and profit currency. |
+//+---------------------------------------------------------------------------+
+string GetSymbolByCurrencies(string base_currency, string profit_currency)
+{
+    // Cycle through all symbols.
+    for (int s = 0; s < SymbolsTotal(false); s++)
+    {
+        // Get symbol name by number.
+        string symbolname = SymbolName(s, false);
+
+        // Skip non-Forex pairs.
+        if ((SymbolInfoInteger(symbolname, SYMBOL_TRADE_CALC_MODE) != SYMBOL_CALC_MODE_FOREX) && (SymbolInfoInteger(symbolname, SYMBOL_TRADE_CALC_MODE) != SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE)) continue;
+
+        // Get its base currency.
+        string b_cur = SymbolInfoString(symbolname, SYMBOL_CURRENCY_BASE);
+        if (b_cur == "RUR") b_cur = "RUB";
+
+        // Get its profit currency.
+        string p_cur = SymbolInfoString(symbolname, SYMBOL_CURRENCY_PROFIT);
+        if (p_cur == "RUR") p_cur = "RUB";
+
+        // If the currency pair matches both currencies, select it in Market Watch and return its name.
+        if ((b_cur == base_currency) && (p_cur == profit_currency))
+        {
+            // Select if necessary.
+            if (!(bool)SymbolInfoInteger(symbolname, SYMBOL_SELECT)) SymbolSelect(symbolname, true);
+
+            return symbolname;
+        }
+    }
+    return NULL;
+}
+
+//+------------------------------------------------------------------+
+//| Get correction coefficient based on currency, trade direction,   |
+//| and current prices.                                              |
+//+------------------------------------------------------------------+
+double GetCurrencyCorrectionCoefficient(MqlTick &tick)
+{
+    if ((tick.ask == 0) || (tick.bid == 0)) return -1; // Data is not yet ready.
+    // Reverse quote.
+    if (ReferenceSymbolMode)
+    {
+        // Using Buy price for reverse quote.
+        return tick.ask;
+    }
+    // Direct quote.
+    else
+    {
+        // Using Sell price for direct quote.
+        return (1 / tick.bid);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate position size depending on money management parameters.|
+//+------------------------------------------------------------------+
+double LotsOptimized(ENUM_ORDER_TYPE dir, double entry)
+{
+    if (!MM) return (Lots);
+
+    double PositionSize = 0, Size;
+
+    if (AccountInfoString(ACCOUNT_CURRENCY) == "") return 0;
+
+    if (FixedBalance > 0)
+    {
+        Size = FixedBalance;
+    }
+    else if (UseEquityInsteadOfBalance)
+    {
+        Size = AccountInfoDouble(ACCOUNT_EQUITY);
+    }
+    else
+    {
+        Size = AccountInfoDouble(ACCOUNT_BALANCE);
+    }
+
+    if (!UseMoneyInsteadOfPercentage) RiskMoney = Size * Risk / 100;
+    else RiskMoney = MoneyRisk;
+
+    double UnitCost = CalculateUnitCost();
+
+    // If profit currency is different from account currency and Symbol is not a Forex pair or futures (CFD, and so on).
+    if ((ProfitCurrency != AccountCurrency) && (CalcMode != SYMBOL_CALC_MODE_FOREX) && (CalcMode != SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE) && (CalcMode != SYMBOL_CALC_MODE_FUTURES) && (CalcMode != SYMBOL_CALC_MODE_EXCH_FUTURES) && (CalcMode != SYMBOL_CALC_MODE_EXCH_FUTURES_FORTS))
+    {
+        double CCC = CalculateAdjustment(); // Valid only for loss calculation.
+        // Adjust the unit cost.
+        UnitCost *= CCC;
+    }
+
+    // If account currency == pair's base currency, adjust UnitCost to future rate (SL). Works only for Forex pairs.
+    if ((AccountCurrency == BaseCurrency) && ((CalcMode == SYMBOL_CALC_MODE_FOREX) || (CalcMode == SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE)))
+    {
+        double current_rate = 1, future_rate = 1;
+        if (dir == ORDER_TYPE_BUY)
+        {
+            if (entry == 0) current_rate = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            else current_rate = entry;
+            future_rate = current_rate - SL * _Point;
+        }
+        else if (dir == ORDER_TYPE_SELL)
+        {
+            if (entry == 0) current_rate = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            else current_rate = entry;
+            future_rate = current_rate + SL * _Point;
+        }
+        if (future_rate == 0) future_rate = _Point; // Zero divide prevention.
+        UnitCost *= (current_rate / future_rate);
+    }
+
+    double TickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double LotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    int LotStep_digits = CountDecimalPlaces(LotStep);
+    if ((SL != 0) && (UnitCost != 0) && (TickSize != 0)) PositionSize = NormalizeDouble(RiskMoney / (SL * _Point * UnitCost / TickSize), LotStep_digits);
+
+    if (PositionSize < SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN))
+    {
+        Print("Calculated position size (" + DoubleToString(PositionSize, 2) + ") is less than minimum position size (" + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN), 2) + "). Setting position size to minimum.");
+        PositionSize = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
+    }
+    else if (PositionSize > SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX))
+    {
+        Print("Calculated position size (" + DoubleToString(PositionSize, 2) + ") is greater than maximum position size (" + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX), 2) + "). Setting position size to maximum.");
+        PositionSize = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX);
+    }
+
+    double steps = PositionSize / LotStep;
+    if (MathAbs(MathRound(steps) - steps) < 0.00000001) steps = MathRound(steps);
+    if (steps - MathFloor(steps) > LotStep / 2)
+    {
+        Print("Calculated position size (" + DoubleToString(PositionSize, 2) + ") uses uneven step size. Allowed step size = " + DoubleToString(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP), 2) + ". Setting position size to " + DoubleToString(MathFloor(steps) * LotStep, 2) + ".");
+        PositionSize = MathFloor(steps) * LotStep;
+    }
+
+    return PositionSize;
 }
 
 //+------------------------------------------------------------------+
